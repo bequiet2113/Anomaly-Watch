@@ -1,7 +1,8 @@
 -- Anomaly Watch — Suite
 -- RightShift = menu | J = Anomaly ESP | K = snapshot
 -- Duble (dwa talerze): po udanym raporcie extra NIE zamienia sie w Missing.
--- Zakladka Filtr: typy raportu, promien dubli, ignorowane nazwy, czulosc.
+-- T albo klik typu na tablecie (R) reportuje nawet spoza domu.
+-- Kamera zostaje na miejscu. Cialo na ulamek sekundy wchodzi do pokoju anomalii.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -57,6 +58,8 @@ local state = {
 	anomaly = false,
 	labels = true,
 	autoSnap = true,
+	autoReport = false,
+	reportGlance = true,
 	pairFix = true,
 	pairRadius = 22,
 	moveScale = 100,
@@ -93,7 +96,6 @@ local nameTags = {}
 local monsterHighlights = {}
 local uiRefresh = {}
 
--- ========== ANOMALY ESP STATE ==========
 local tracked = {}
 local extras = {}
 local knownHumanoids = {}
@@ -232,19 +234,30 @@ end
 
 local function decalSig(obj)
 	local t = {}
+	if obj:IsA("MeshPart") then
+		t[#t + 1] = "mesh:" .. tostring(obj.MeshId) .. ":" .. tostring(obj.TextureID)
+	end
 	for _, c in ipairs(obj:GetChildren()) do
 		if c:IsA("Decal") or c:IsA("Texture") then
-			table.insert(t, c.ClassName .. c.Name .. tostring(c.Texture) .. tostring(c.Color3) .. tostring(c.Transparency))
+			local extra = ""
+			if c:IsA("Texture") then
+				extra = string.format(":%.1f:%.1f", c.OffsetStudsU or 0, c.OffsetStudsV or 0)
+			end
+			t[#t + 1] = c.ClassName .. c.Name .. tostring(c.Face) .. tostring(c.Texture) .. tostring(c.Color3) .. string.format("%.2f", c.Transparency) .. extra
+		elseif c:IsA("SurfaceAppearance") then
+			t[#t + 1] = "sa:" .. tostring(c.ColorMap) .. ":" .. tostring(c.NormalMap) .. ":" .. tostring(c.Color)
+		elseif c:IsA("SpecialMesh") then
+			t[#t + 1] = "sm:" .. tostring(c.MeshId) .. ":" .. tostring(c.TextureId)
 		elseif c:IsA("SurfaceGui") then
 			local texts = { "sg", c.Name, tostring(c.Enabled) }
 			for _, d in ipairs(c:GetDescendants()) do
-				if d:IsA("TextLabel") or d:IsA("TextButton") then
-					table.insert(texts, d.Text)
+				if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+					texts[#texts + 1] = (d.Text or "") .. tostring(d.TextColor3)
 				elseif d:IsA("ImageLabel") or d:IsA("ImageButton") then
-					table.insert(texts, tostring(d.Image))
+					texts[#texts + 1] = tostring(d.Image) .. tostring(d.ImageColor3)
 				end
 			end
-			table.insert(t, table.concat(texts, ","))
+			t[#t + 1] = table.concat(texts, ",")
 		end
 	end
 	table.sort(t)
@@ -334,19 +347,13 @@ local function clearMark(key)
 		return
 	end
 	pcall(function()
-		if m.hl then
-			m.hl:Destroy()
-		end
+		if m.hl then m.hl:Destroy() end
 	end)
 	pcall(function()
-		if m.gui then
-			m.gui:Destroy()
-		end
+		if m.gui then m.gui:Destroy() end
 	end)
 	pcall(function()
-		if m.marker then
-			m.marker:Destroy()
-		end
+		if m.marker then m.marker:Destroy() end
 	end)
 	marks[key] = nil
 end
@@ -420,7 +427,6 @@ local function applyDesired(desired)
 		hl.OutlineTransparency = 0
 		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 		hl.Parent = d.adornee
-
 		local gui, label
 		if state.labels then
 			local host = d.adornee:IsA("BasePart") and d.adornee or d.adornee:FindFirstChildWhichIsA("BasePart", true)
@@ -497,6 +503,11 @@ end
 
 local statusLabel
 local rowsFrame
+local reportAnomaly
+local hookTablet
+local confirmIds = {}
+local scanGen = 0
+local reportBusy = false
 
 local function refreshAnomalyList()
 	if not rowsFrame then
@@ -521,7 +532,7 @@ local function refreshAnomalyList()
 	end
 	lastListSig = sig
 	for _, ch in ipairs(rowsFrame:GetChildren()) do
-		if ch:IsA("TextLabel") then
+		if ch:IsA("TextLabel") or ch:IsA("TextButton") then
 			ch:Destroy()
 		end
 	end
@@ -538,7 +549,7 @@ local function refreshAnomalyList()
 		return
 	end
 	for _, it in ipairs(anomalyItems) do
-		local row = Instance.new("TextLabel")
+		local row = Instance.new("TextButton")
 		row.Size = UDim2.new(1, -8, 0, 28)
 		row.BackgroundColor3 = Color3.fromRGB(16, 32, 22)
 		row.BackgroundTransparency = 0.15
@@ -548,11 +559,39 @@ local function refreshAnomalyList()
 		row.TextSize = 11
 		row.TextXAlignment = Enum.TextXAlignment.Left
 		row.TextTruncate = Enum.TextTruncate.AtEnd
+		row.AutoButtonColor = true
 		row.Parent = rowsFrame
 		local c = Instance.new("UICorner")
 		c.CornerRadius = UDim.new(0, 5)
 		c.Parent = row
+		row.MouseButton1Click:Connect(function()
+			if reportAnomaly then
+				reportAnomaly(it)
+			end
+		end)
 	end
+end
+
+local function motionFlags(name, parent)
+	local blob = string.lower((name or "") .. " " .. (parent and parent.Name or ""))
+	local function has(w)
+		return string.find(blob, w, 1, true) ~= nil
+	end
+	local ambient = has("wiatrak") or has("windmill") or has("ventilat") or has("propeller") or has("turbine") or has("clock") or has("zegar") or has("rotor") or has("spinner") or has("pendulum") or has("fanblade") or has("ceilingfan")
+	if not ambient then
+		ambient = has("fan") and not has("fancy")
+	end
+	local doorish = has("door") or has("drzwi") or has("drawer") or has("szuflada") or has("fridge") or has("lodowka") or has("cabinet") or has("szafa") or has("closet")
+	local clockish = has("clock") or has("zegar") or has("timer") or has("stopwatch")
+	return ambient, doorish, clockish
+end
+
+local function axisStretch(a, b)
+	local function ratio(x, y)
+		local lo = math.max(math.min(x, y), 0.05)
+		return math.max(x, y) / lo
+	end
+	return math.max(ratio(a.X, b.X), ratio(a.Y, b.Y), ratio(a.Z, b.Z))
 end
 
 local function takeSnapshot()
@@ -563,6 +602,7 @@ local function takeSnapshot()
 	intruderWatch = {}
 	anomalyItems = {}
 	lastListSig = ""
+	confirmIds = {}
 	statusOverride = nil
 	local n = 0
 	for _, obj in ipairs(Workspace:GetDescendants()) do
@@ -588,7 +628,20 @@ local function takeSnapshot()
 				parent = obj.Parent,
 				name = obj.Name,
 				priority = isPriority(obj.Name),
+				mesh = obj:IsA("MeshPart") and obj.MeshId or "",
+				tex = obj:IsA("MeshPart") and obj.TextureID or "",
+				refl = obj.Reflectance or 0,
+				childN = #obj:GetChildren(),
+				hasFx = false,
+				forceImg = false,
+				slice = n % 4,
+				swingCap = math.max(16, obj.Size.Magnitude * 1.5),
 			}
+			local amb, door, clock = motionFlags(obj.Name, obj.Parent)
+			tracked[obj].ambient = amb
+			tracked[obj].doorish = door
+			tracked[obj].clockish = clock
+			tracked[obj].hasFx = tracked[obj].particles ~= ""
 			n += 1
 		elseif obj:IsA("Light") and not isPlayerRelated(obj) then
 			local ln = string.lower(obj.Name)
@@ -621,20 +674,6 @@ local function keyName(name, parent)
 	return n
 end
 
-local function sameProp(nameA, sizeA, nameB, sizeB)
-	if type(nameA) ~= "string" or type(nameB) ~= "string" then
-		return false
-	end
-	if nameA ~= nameB then
-		return false
-	end
-	if typeof(sizeA) ~= "Vector3" or typeof(sizeB) ~= "Vector3" then
-		return false
-	end
-	local tol = math.max(0.35, sizeA.Magnitude * 0.22)
-	return (sizeA - sizeB).Magnitude <= tol
-end
-
 local function buildPropSets()
 	local baseline, live = {}, {}
 	for obj, data in pairs(tracked) do
@@ -655,10 +694,27 @@ local function buildPropSets()
 	return baseline, live
 end
 
-local function countAround(list, name, size, pos, radius)
-	local n = 0
+local function bucketize(list)
+	local map = {}
 	for _, it in ipairs(list) do
-		if sameProp(name, size, it.name, it.size) and (it.pos - pos).Magnitude <= radius then
+		local b = map[it.name]
+		if not b then
+			b = {}
+			map[it.name] = b
+		end
+		b[#b + 1] = it
+	end
+	return map
+end
+
+local function countBucket(map, name, size, pos, radius)
+	local bucket = map[name]
+	if not bucket then
+		return 0
+	end
+	local n = 0
+	for _, it in ipairs(bucket) do
+		if (size - it.size).Magnitude <= math.max(0.35, size.Magnitude * 0.22) and (it.pos - pos).Magnitude <= radius then
 			n += 1
 		end
 	end
@@ -689,13 +745,18 @@ local function scanAnomalies()
 		end
 		return
 	end
-
 	local desired = {}
 	local missingGroups = {}
 	local propBase, propLive = buildPropSets()
+	local baseMap, liveMap = bucketize(propBase), bucketize(propLive)
 	local pairR = state.pairRadius or 22
-
+	scanGen += 1
+	local budget = 0
 	for obj, data in pairs(tracked) do
+		budget += 1
+		if budget % 400 == 0 then
+			task.wait()
+		end
 		if data.light then
 			if not obj.Parent then
 				local host = data.parent
@@ -703,19 +764,16 @@ local function scanAnomalies()
 					want(desired, adornTarget(host), "Strange Light", data.name, instancePos(host))
 				end
 			else
-				local changed = false
-				if colorDistance(obj.Color, data.color) > 0.08 then
-					changed = true
+				local colorChanged = colorDistance(obj.Color, data.color) > 0.08
+				local brightChanged = math.abs(obj.Brightness - data.brightness) > 0.35
+				local rangeChanged = data.range and math.abs(obj.Range - data.range) > 2
+				local enabledChanged = obj.Enabled ~= data.enabled
+				if enabledChanged and not colorChanged and not brightChanged then
+					data.lightStreak = (data.lightStreak or 0) + 1
+				else
+					data.lightStreak = 0
 				end
-				if math.abs(obj.Brightness - data.brightness) > 0.35 then
-					changed = true
-				end
-				if obj.Enabled ~= data.enabled then
-					changed = true
-				end
-				if data.range and math.abs(obj.Range - data.range) > 2 then
-					changed = true
-				end
+				local changed = colorChanged or brightChanged or rangeChanged or (enabledChanged and (data.lightStreak or 0) >= 2)
 				if changed then
 					local host = obj.Parent and obj.Parent:IsA("BasePart") and obj.Parent or obj
 					want(desired, adornTarget(host), "Strange Light", data.name, instancePos(host))
@@ -723,13 +781,12 @@ local function scanAnomalies()
 			end
 			continue
 		end
-
 		if not obj.Parent then
 			local kn = keyName(data.name, data.parent)
 			local filled = false
 			if state.pairFix and data.size and data.cf then
-				local b = countAround(propBase, kn, data.size, data.cf.Position, pairR)
-				local l = countAround(propLive, kn, data.size, data.cf.Position, pairR)
+				local b = countBucket(baseMap, kn, data.size, data.cf.Position, pairR)
+				local l = countBucket(liveMap, kn, data.size, data.cf.Position, pairR)
 				filled = b > 0 and l >= b
 			end
 			if not filled then
@@ -738,7 +795,6 @@ local function scanAnomalies()
 			end
 			continue
 		end
-
 		local reason
 		local pri = data.priority
 		local posD = (obj.Position - data.cf.Position).Magnitude
@@ -747,16 +803,9 @@ local function scanAnomalies()
 		local scale = (state.moveScale or 100) / 100
 		local pThresh = (pri and 0.08 or 0.28) * scale
 		local rThresh = (pri and 0.12 or 0.35) * scale
-		local blob = string.lower(data.name .. " " .. obj.Name .. " " .. ((obj.Parent and obj.Parent.Name) or "") .. " " .. ((data.parent and data.parent.Name) or ""))
-		local function blobHas(w)
-			return string.find(blob, w, 1, true) ~= nil
-		end
-		local ambient = blobHas("wiatrak") or blobHas("windmill") or blobHas("ventilat") or blobHas("propeller") or blobHas("turbine") or blobHas("clock") or blobHas("zegar") or blobHas("rotor") or blobHas("spinner") or blobHas("pendulum") or blobHas("fanblade") or blobHas("ceilingfan")
-		if not ambient then
-			ambient = blobHas("fan") and not blobHas("fancy")
-		end
-		local doorish = blobHas("door") or blobHas("drzwi") or blobHas("drawer") or blobHas("szuflada") or blobHas("fridge") or blobHas("lodowka") or blobHas("cabinet") or blobHas("szafa") or blobHas("closet")
-		local swingCap = math.max(16, data.size.Magnitude * 1.5)
+		local ambient = data.ambient
+		local doorish = data.doorish
+		local swingCap = data.swingCap or math.max(16, data.size.Magnitude * 1.5)
 		local deviant = posD > pThresh or rotD > rThresh
 		if doorish and deviant and not data.sawMove and hrp and sizeD < 0.25 and posD < swingCap then
 			local nearNow = (obj.Position - hrp.Position).Magnitude < 16
@@ -772,8 +821,38 @@ local function scanAnomalies()
 			data.playerDoor = false
 		end
 		local suppressMove = sizeD < 0.25 and posD < swingCap and (ambient or data.playerDoor)
-
-		if sizeD > (pri and 0.1 or 0.32) then
+		local stretch = axisStretch(obj.Size, data.size)
+		local kids = #obj:GetChildren()
+		local img = false
+		if obj:IsA("MeshPart") and ((obj.MeshId or "") ~= (data.mesh or "") or (obj.TextureID or "") ~= (data.tex or "")) then
+			img = true
+		elseif math.abs((obj.Reflectance or 0) - (data.refl or 0)) > 0.28 then
+			img = true
+		end
+		local oldKids = data.childN or -1
+		local due = data.forceImg or kids ~= oldKids or (scanGen % 4 == (data.slice or 0))
+		if not img and due then
+			local sig = decalSig(obj)
+			local baseSig = data.decal or ""
+			if data.clockish then
+				sig = string.gsub(sig, "%d", "#")
+				baseSig = string.gsub(baseSig, "%d", "#")
+			end
+			if sig ~= baseSig then
+				img = true
+			end
+			data.childN = kids
+			data.forceImg = false
+		end
+		local fxChanged = false
+		if data.hasFx or kids ~= oldKids then
+			local ps = particleSig(obj)
+			if ps ~= (data.particles or "") then
+				fxChanged = true
+				data.hasFx = ps ~= ""
+			end
+		end
+		if sizeD > (pri and 0.1 or 0.32) or stretch >= 1.45 then
 			reason = "Distorted Object"
 		elseif data.transparency < 0.45 and obj.Transparency >= 0.9 then
 			reason = "Missing Object"
@@ -781,18 +860,17 @@ local function scanAnomalies()
 			reason = "Extra Object"
 		elseif deviant and not suppressMove then
 			reason = "Moved Object"
-		elseif decalSig(obj) ~= data.decal then
+		elseif img then
 			reason = "Strange Imagery"
 		elseif colorDistance(obj.Color, data.color) > (pri and 0.05 or 0.12) then
 			reason = "Strange Imagery"
 		elseif obj.Material ~= data.material then
 			reason = "Strange Imagery"
-		elseif particleSig(obj) ~= data.particles then
+		elseif fxChanged and not suppressMove then
 			reason = "Other"
-		elseif math.abs(obj.Transparency - data.transparency) > 0.2 then
+		elseif math.abs(obj.Transparency - data.transparency) > 0.2 and not (suppressMove and ambient) then
 			reason = "Other"
 		end
-
 		if reason then
 			local target = adornTarget(obj)
 			local hum = humanoidModelOf(obj)
@@ -802,13 +880,11 @@ local function scanAnomalies()
 				want(desired, target, reason, target.Name, instancePos(target) or obj.Position)
 			end
 		end
-
 		if obj:GetAttribute("Anomaly") == true or obj:GetAttribute("Reportable") == true then
 			local target = adornTarget(obj)
 			want(desired, target, "Other", target.Name, instancePos(target))
 		end
 	end
-
 	local extraAlive = 0
 	for obj in pairs(extras) do
 		if obj.Parent and not tracked[obj] and not isOurStuff(obj) and not isPlayerRelated(obj) then
@@ -823,7 +899,6 @@ local function scanAnomalies()
 		statusOverride = "Mapa sie przebudowala — zrob snapshot jeszcze raz"
 		statusOverrideUntil = os.clock() + 6
 	end
-
 	if not suppressExtras then
 		for obj in pairs(extras) do
 			if not obj.Parent then
@@ -841,8 +916,8 @@ local function scanAnomalies()
 			local skipTwin = false
 			if obj:IsA("BasePart") and state.pairFix then
 				local kn = keyName(obj.Name, obj.Parent)
-				local b = countAround(propBase, kn, obj.Size, obj.Position, pairR)
-				local l = countAround(propLive, kn, obj.Size, obj.Position, pairR)
+				local b = countBucket(baseMap, kn, obj.Size, obj.Position, pairR)
+				local l = countBucket(liveMap, kn, obj.Size, obj.Position, pairR)
 				skipTwin = l <= b
 			end
 			if not skipTwin then
@@ -853,7 +928,6 @@ local function scanAnomalies()
 			end
 		end
 	end
-
 	for model in pairs(intruderWatch) do
 		if not model.Parent or playerModelOf(model) or isOurStuff(model) then
 			intruderWatch[model] = nil
@@ -865,7 +939,6 @@ local function scanAnomalies()
 		end
 		want(desired, model, "Intruder", model.Name, instancePos(model))
 	end
-
 	for model, origin in pairs(knownHumanoids) do
 		if model.Parent and not playerModelOf(model) and not intruderWatch[model] then
 			local pos = instancePos(model)
@@ -876,7 +949,6 @@ local function scanAnomalies()
 			knownHumanoids[model] = nil
 		end
 	end
-
 	for gid, data in pairs(missingGroups) do
 		local key = "missing:" .. gid
 		local text = "Missing Object\n" .. data.name
@@ -894,7 +966,6 @@ local function scanAnomalies()
 			keep = true,
 		}
 	end
-
 	local visualDesired = {}
 	for key, d in pairs(desired) do
 		if not d.keep then
@@ -902,7 +973,6 @@ local function scanAnomalies()
 		end
 	end
 	applyDesired(visualDesired)
-
 	for key in pairs(marks) do
 		local d = desired[key]
 		local gone = d and not d.keep and d.adornee and not d.adornee.Parent
@@ -910,21 +980,32 @@ local function scanAnomalies()
 			clearMark(key)
 		end
 	end
-
 	local items = {}
 	local seen = {}
+	local nextConfirm = {}
 	for _, d in pairs(desired) do
-		local id = d.reason .. "|" .. d.name .. "|" .. tostring(d.adornee)
+		local pos = d.pos
+		local id = d.reason .. "|" .. (d.name or "") .. "|" .. tostring(d.adornee)
 		if not seen[id] then
 			seen[id] = true
-			local pos = d.pos
-			local dist = 0
-			if hrp and pos then
-				dist = (hrp.Position - pos).Magnitude
+			nextConfirm[id] = true
+			local stable = confirmIds[id] or d.reason == "Intruder"
+			if stable then
+				local dist = 0
+				if hrp and pos then
+					dist = (hrp.Position - pos).Magnitude
+				end
+				table.insert(items, {
+					reason = d.reason,
+					name = d.name,
+					dist = dist,
+					pos = pos,
+					adornee = d.adornee,
+				})
 			end
-			table.insert(items, { reason = d.reason, name = d.name, dist = dist })
 		end
 	end
+	confirmIds = nextConfirm
 	table.sort(items, function(a, b)
 		return (a.dist or 0) < (b.dist or 0)
 	end)
@@ -1028,7 +1109,6 @@ local function handleThreat(level)
 	refreshAnomalyList()
 end
 
--- ========== MOVEMENT ==========
 local function setNoclip(on)
 	if not char then
 		return
@@ -1050,22 +1130,16 @@ end
 
 local function destroyFly()
 	if bv then
-		pcall(function()
-			bv:Destroy()
-		end)
+		pcall(function() bv:Destroy() end)
 		bv = nil
 	end
 	if bg then
-		pcall(function()
-			bg:Destroy()
-		end)
+		pcall(function() bg:Destroy() end)
 		bg = nil
 	end
 	if hrp then
 		local att = hrp:FindFirstChild("AW_FlyAtt")
-		if att then
-			att:Destroy()
-		end
+		if att then att:Destroy() end
 		pcall(function()
 			hrp.AssemblyLinearVelocity = Vector3.zero
 		end)
@@ -1097,18 +1171,10 @@ local function getMove()
 		return mv
 	end
 	local look, right = Camera.CFrame.LookVector, Camera.CFrame.RightVector
-	if input.fwd then
-		mv += Vector3.new(look.X, 0, look.Z)
-	end
-	if input.back then
-		mv -= Vector3.new(look.X, 0, look.Z)
-	end
-	if input.right then
-		mv += Vector3.new(right.X, 0, right.Z)
-	end
-	if input.left then
-		mv -= Vector3.new(right.X, 0, right.Z)
-	end
+	if input.fwd then mv += Vector3.new(look.X, 0, look.Z) end
+	if input.back then mv -= Vector3.new(look.X, 0, look.Z) end
+	if input.right then mv += Vector3.new(right.X, 0, right.Z) end
+	if input.left then mv -= Vector3.new(right.X, 0, right.Z) end
 	return mv.Magnitude > 0 and mv.Unit or mv
 end
 
@@ -1176,18 +1242,11 @@ local function applySpeedJump()
 	humanoid.JumpPower = state.jump
 end
 
--- ========== PLAYER ESP ==========
 local function createChams(plr)
-	if plr == player then
-		return
-	end
+	if plr == player then return end
 	local c = plr.Character
-	if not c then
-		return
-	end
-	if playerHighlights[plr] then
-		playerHighlights[plr]:Destroy()
-	end
+	if not c then return end
+	if playerHighlights[plr] then playerHighlights[plr]:Destroy() end
 	local hl = Instance.new("Highlight")
 	hl.Name = "Chams"
 	hl.Adornee = c
@@ -1202,9 +1261,7 @@ end
 
 local function clearChams()
 	for _, hl in pairs(playerHighlights) do
-		if hl then
-			hl:Destroy()
-		end
+		if hl then hl:Destroy() end
 	end
 	playerHighlights = {}
 end
@@ -1212,32 +1269,20 @@ end
 local function setChams(on)
 	state.chams = on
 	if on then
-		for _, p in ipairs(Players:GetPlayers()) do
-			createChams(p)
-		end
+		for _, p in ipairs(Players:GetPlayers()) do createChams(p) end
 	else
 		clearChams()
 	end
-	if uiRefresh.chams then
-		uiRefresh.chams()
-	end
+	if uiRefresh.chams then uiRefresh.chams() end
 end
 
 local function createName(plr)
-	if plr == player then
-		return
-	end
+	if plr == player then return end
 	local c = plr.Character
-	if not c then
-		return
-	end
+	if not c then return end
 	local head = c:FindFirstChild("Head")
-	if not head then
-		return
-	end
-	if nameTags[plr] then
-		nameTags[plr]:Destroy()
-	end
+	if not head then return end
+	if nameTags[plr] then nameTags[plr]:Destroy() end
 	local bb = Instance.new("BillboardGui")
 	bb.Name = "NameESP"
 	bb.Adornee = head
@@ -1259,9 +1304,7 @@ end
 
 local function clearNames()
 	for _, t in pairs(nameTags) do
-		if t then
-			t:Destroy()
-		end
+		if t then t:Destroy() end
 	end
 	nameTags = {}
 end
@@ -1269,15 +1312,11 @@ end
 local function setNames(on)
 	state.names = on
 	if on then
-		for _, p in ipairs(Players:GetPlayers()) do
-			createName(p)
-		end
+		for _, p in ipairs(Players:GetPlayers()) do createName(p) end
 	else
 		clearNames()
 	end
-	if uiRefresh.names then
-		uiRefresh.names()
-	end
+	if uiRefresh.names then uiRefresh.names() end
 end
 
 local function isMonster(model)
@@ -1285,9 +1324,7 @@ local function isMonster(model)
 		return false
 	end
 	local n = string.lower(model.Name)
-	if nameHas(n, monsterWords) then
-		return true
-	end
+	if nameHas(n, monsterWords) then return true end
 	if model:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(model) then
 		return true
 	end
@@ -1296,9 +1333,7 @@ end
 
 local function clearMonsters()
 	for _, hl in pairs(monsterHighlights) do
-		if hl then
-			hl:Destroy()
-		end
+		if hl then hl:Destroy() end
 	end
 	monsterHighlights = {}
 end
@@ -1324,9 +1359,7 @@ local function scanMonsters()
 	end
 	for m, hl in pairs(monsterHighlights) do
 		if not alive[m] then
-			if hl then
-				hl:Destroy()
-			end
+			if hl then hl:Destroy() end
 			monsterHighlights[m] = nil
 		end
 	end
@@ -1334,31 +1367,17 @@ end
 
 local function setMonster(on)
 	state.monster = on
-	if on then
-		scanMonsters()
-	else
-		clearMonsters()
-	end
-	if uiRefresh.monster then
-		uiRefresh.monster()
-	end
+	if on then scanMonsters() else clearMonsters() end
+	if uiRefresh.monster then uiRefresh.monster() end
 end
 
 local function hookPlayer(plr)
-	if plr == player then
-		return
-	end
+	if plr == player then return end
 	track(plr.CharacterAdded:Connect(function()
 		task.wait(0.35)
-		if not running then
-			return
-		end
-		if state.chams then
-			createChams(plr)
-		end
-		if state.names then
-			createName(plr)
-		end
+		if not running then return end
+		if state.chams then createChams(plr) end
+		if state.names then createName(plr) end
 	end))
 end
 
@@ -1377,7 +1396,6 @@ track(Players.PlayerRemoving:Connect(function(plr)
 	end
 end))
 
--- ========== CLEAN OLD ESP ==========
 for _, d in ipairs(Workspace:GetDescendants()) do
 	if d:IsA("Highlight") and (d.Name == "Chams" or d.Name == "MonsterESP" or d.Name == "AW_Anomaly") then
 		d:Destroy()
@@ -1386,11 +1404,8 @@ for _, d in ipairs(Workspace:GetDescendants()) do
 	end
 end
 local oldGui = playerGui:FindFirstChild("AnomalySuite")
-if oldGui then
-	oldGui:Destroy()
-end
+if oldGui then oldGui:Destroy() end
 
--- ========== GUI ==========
 local screen = Instance.new("ScreenGui")
 screen.Name = "AnomalySuite"
 screen.ResetOnSpawn = false
@@ -1430,7 +1445,6 @@ titleFill.Position = UDim2.new(0, 0, 1, -16)
 titleFill.BackgroundColor3 = Color3.fromRGB(18, 28, 24)
 titleFill.BorderSizePixel = 0
 titleFill.Parent = title
-
 local accent = Instance.new("Frame")
 accent.Size = UDim2.new(0, 3, 0, 28)
 accent.Position = UDim2.fromOffset(12, 13)
@@ -1440,7 +1454,6 @@ accent.Parent = title
 local accentCorner = Instance.new("UICorner")
 accentCorner.CornerRadius = UDim.new(1, 0)
 accentCorner.Parent = accent
-
 local titleText = Instance.new("TextLabel")
 titleText.BackgroundTransparency = 1
 titleText.Position = UDim2.fromOffset(24, 6)
@@ -1451,7 +1464,6 @@ titleText.TextXAlignment = Enum.TextXAlignment.Left
 titleText.TextColor3 = Color3.fromRGB(236, 255, 244)
 titleText.Text = "ANOMALY SUITE"
 titleText.Parent = title
-
 local subText = Instance.new("TextLabel")
 subText.BackgroundTransparency = 1
 subText.Position = UDim2.fromOffset(24, 28)
@@ -1462,7 +1474,6 @@ subText.TextXAlignment = Enum.TextXAlignment.Left
 subText.TextColor3 = Color3.fromRGB(120, 160, 140)
 subText.Text = "RightShift menu   ·   J anomaly ESP"
 subText.Parent = title
-
 local closeBtn = Instance.new("TextButton")
 closeBtn.Size = UDim2.fromOffset(26, 26)
 closeBtn.Position = UDim2.new(1, -36, 0, 14)
@@ -1538,7 +1549,6 @@ local function makeTab(name)
 		showTab(name)
 	end)
 	tabButtons[name] = btn
-
 	local page = Instance.new("ScrollingFrame")
 	page.Name = name
 	page.Size = UDim2.new(1, -16, 1, -108)
@@ -1581,7 +1591,6 @@ local function makeToggle(parent, name, id, getter, setter)
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, 8)
 	c.Parent = btn
-
 	local lbl = Instance.new("TextLabel")
 	lbl.BackgroundTransparency = 1
 	lbl.Position = UDim2.fromOffset(12, 0)
@@ -1592,7 +1601,6 @@ local function makeToggle(parent, name, id, getter, setter)
 	lbl.TextColor3 = Color3.fromRGB(226, 230, 236)
 	lbl.Text = name
 	lbl.Parent = btn
-
 	local pill = Instance.new("Frame")
 	pill.Size = UDim2.fromOffset(42, 20)
 	pill.Position = UDim2.new(1, -52, 0.5, -10)
@@ -1611,7 +1619,6 @@ local function makeToggle(parent, name, id, getter, setter)
 	local kc = Instance.new("UICorner")
 	kc.CornerRadius = UDim.new(1, 0)
 	kc.Parent = knob
-
 	local function refresh()
 		local on = getter()
 		pill.BackgroundColor3 = on and Color3.fromRGB(28, 110, 62) or Color3.fromRGB(48, 32, 34)
@@ -1636,7 +1643,6 @@ local function makeSlider(parent, name, minV, maxV, getter, setter)
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, 8)
 	c.Parent = frame
-
 	local lbl = Instance.new("TextLabel")
 	lbl.BackgroundTransparency = 1
 	lbl.Position = UDim2.fromOffset(12, 6)
@@ -1647,7 +1653,6 @@ local function makeSlider(parent, name, minV, maxV, getter, setter)
 	lbl.TextColor3 = Color3.fromRGB(220, 224, 230)
 	lbl.Text = name .. "   " .. tostring(getter())
 	lbl.Parent = frame
-
 	local bar = Instance.new("TextButton")
 	bar.Size = UDim2.new(1, -24, 0, 10)
 	bar.Position = UDim2.fromOffset(12, 32)
@@ -1658,7 +1663,6 @@ local function makeSlider(parent, name, minV, maxV, getter, setter)
 	local bc = Instance.new("UICorner")
 	bc.CornerRadius = UDim.new(1, 0)
 	bc.Parent = bar
-
 	local fill = Instance.new("Frame")
 	fill.Size = UDim2.new(math.clamp((getter() - minV) / (maxV - minV), 0, 1), 0, 1, 0)
 	fill.BackgroundColor3 = Color3.fromRGB(0, 190, 150)
@@ -1667,7 +1671,6 @@ local function makeSlider(parent, name, minV, maxV, getter, setter)
 	local fc = Instance.new("UICorner")
 	fc.CornerRadius = UDim.new(1, 0)
 	fc.Parent = fill
-
 	local drag = false
 	local function setFromX(x)
 		local rel = math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
@@ -1688,9 +1691,7 @@ local function makeSlider(parent, name, minV, maxV, getter, setter)
 		end
 	end))
 	track(UserInputService.InputChanged:Connect(function(inp)
-		if not drag then
-			return
-		end
+		if not drag then return end
 		if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
 			setFromX(inp.Position.X)
 		end
@@ -1729,80 +1730,39 @@ local function makeHint(parent, text, tall)
 	return lbl
 end
 
-makeToggle(pageMove, "Fly   [F]", "fly", function()
-	return state.fly
-end, setFlyState)
-makeToggle(pageMove, "Noclip   [N]", "noclip", function()
-	return state.noclip
-end, setNoclipState)
-makeToggle(pageMove, "Infinite Jump", "infJump", function()
-	return state.infJump
-end, function(v)
-	state.infJump = v
-end)
-makeToggle(pageMove, "No Fall", "noFall", function()
-	return state.noFall
-end, function(v)
-	state.noFall = v
-end)
-makeSlider(pageMove, "WalkSpeed", 16, 120, function()
-	return state.speed
-end, function(v)
-	state.speed = v
-	applySpeedJump()
-end)
-makeSlider(pageMove, "JumpPower", 50, 220, function()
-	return state.jump
-end, function(v)
-	state.jump = v
-	applySpeedJump()
-end)
+makeToggle(pageMove, "Fly   [F]", "fly", function() return state.fly end, setFlyState)
+makeToggle(pageMove, "Noclip   [N]", "noclip", function() return state.noclip end, setNoclipState)
+makeToggle(pageMove, "Infinite Jump", "infJump", function() return state.infJump end, function(v) state.infJump = v end)
+makeToggle(pageMove, "No Fall", "noFall", function() return state.noFall end, function(v) state.noFall = v end)
+makeSlider(pageMove, "WalkSpeed", 16, 120, function() return state.speed end, function(v) state.speed = v applySpeedJump() end)
+makeSlider(pageMove, "JumpPower", 50, 220, function() return state.jump end, function(v) state.jump = v applySpeedJump() end)
 makeHint(pageMove, "Fly: WASD, Space gora, LeftCtrl dol. Menu nie blokuje sterowania.", 32)
 
-makeToggle(pageVis, "Fullbright   [G]", "fullbright", function()
-	return state.fullbright
-end, setFullbright)
-makeToggle(pageVis, "FOV 120   [V]", "fov", function()
-	return state.fov
-end, setFOV)
-makeToggle(pageVis, "Player Chams   [B]", "chams", function()
-	return state.chams
-end, setChams)
-makeToggle(pageVis, "Name ESP", "names", function()
-	return state.names
-end, setNames)
-makeToggle(pageVis, "Monster ESP   [M]", "monster", function()
-	return state.monster
-end, setMonster)
+makeToggle(pageVis, "Fullbright   [G]", "fullbright", function() return state.fullbright end, setFullbright)
+makeToggle(pageVis, "FOV 120   [V]", "fov", function() return state.fov end, setFOV)
+makeToggle(pageVis, "Player Chams   [B]", "chams", function() return state.chams end, setChams)
+makeToggle(pageVis, "Name ESP", "names", function() return state.names end, setNames)
+makeToggle(pageVis, "Monster ESP   [M]", "monster", function() return state.monster end, setMonster)
 makeHint(pageVis, "Monster ESP jest czerwony (intruder / humanoid). Anomaly ESP na zakladce obok jest zielony i mowi co wpisac w tablet.", 48)
 
-makeToggle(pageAnom, "Anomaly ESP   [J]", "anomaly", function()
-	return state.anomaly
-end, setAnomaly)
-makeToggle(pageAnom, "Etykiety typu", "labels", function()
-	return state.labels
-end, function(v)
+makeToggle(pageAnom, "Anomaly ESP   [J]", "anomaly", function() return state.anomaly end, setAnomaly)
+makeToggle(pageAnom, "Etykiety typu", "labels", function() return state.labels end, function(v)
 	state.labels = v
 	if state.anomaly then
 		clearAllMarks()
 		scanAnomalies()
 	end
 end)
-
-makeToggle(pageAnom, "Auto snapshot (Threat)", "autoSnap", function()
-	return state.autoSnap
-end, function(v)
-	state.autoSnap = v
-end)
-
+makeToggle(pageAnom, "Auto snapshot (Threat)", "autoSnap", function() return state.autoSnap end, function(v) state.autoSnap = v end)
 makeButton(pageAnom, "Snapshot czystej mapy   [K]", Color3.fromRGB(24, 92, 58), function()
 	local n = takeSnapshot()
 	statusOverride = string.format("Snapshot: %d obiektow. Czekam na zmiany.", n)
 	statusOverrideUntil = os.clock() + 3
 	refreshAnomalyList()
 end)
-
-makeHint(pageAnom, "None odswieza baze. None -> Mild zamraza ja. Dwa takie same obiekty (talerz): extra swieci tylko na kopii. Jak po raporcie zostaje tyle, ile w bazie, Missing sie nie zapala.", 72)
+makeToggle(pageAnom, "Auto raport", "autoReport", function() return state.autoReport end, function(v) state.autoReport = v end)
+makeToggle(pageAnom, "Raport przez sciany", "reportGlance", function() return state.reportGlance end, function(v) state.reportGlance = v end)
+makeHint(pageAnom, "Jestes poza domem: otworz tablet (R) i kliknij typ, np. Distorted Object. Skrypt na moment wstawia cie do pokoju tej anomalii, kamera zostaje na zewnatrz, raport schodzi, wracasz. Klik wiersza wybiera konkretna.", 78)
 
 statusLabel = Instance.new("TextLabel")
 statusLabel.Size = UDim2.new(1, 0, 0, 18)
@@ -1823,7 +1783,6 @@ rowsFrame.Parent = pageAnom
 local rowsLayout = Instance.new("UIListLayout")
 rowsLayout.Padding = UDim.new(0, 4)
 rowsLayout.Parent = rowsFrame
-
 refreshAnomalyList()
 
 local function setIgnoreText(v)
@@ -1877,50 +1836,17 @@ local function makeBox(parent, name, placeholder)
 	end)
 end
 
-makeToggle(pageSet, "Licz dubli (talerze)", "pairFix", function()
-	return state.pairFix
-end, function(v)
-	state.pairFix = v
-	clearAllMarks()
-end)
-makeSlider(pageSet, "Promien dubli", 8, 80, function()
-	return state.pairRadius
-end, function(v)
-	state.pairRadius = v
-end)
-makeSlider(pageSet, "Czulosc ruchu %", 40, 220, function()
-	return state.moveScale
-end, function(v)
-	state.moveScale = v
-end)
-makeSlider(pageSet, "Zasieg etykiet", 60, 900, function()
-	return state.labelDist
-end, function(v)
-	state.labelDist = v
-	clearAllMarks()
-end)
-makeSlider(pageSet, "Przezroczystosc %", 10, 85, function()
-	return state.fillTrans
-end, function(v)
-	state.fillTrans = v
-	clearAllMarks()
-end)
-makeToggle(pageSet, "Tylko obiekty z listy", "onlyPriority", function()
-	return state.onlyPriority
-end, function(v)
-	state.onlyPriority = v
-	clearAllMarks()
-end)
+makeToggle(pageSet, "Licz dubli (talerze)", "pairFix", function() return state.pairFix end, function(v) state.pairFix = v clearAllMarks() end)
+makeSlider(pageSet, "Promien dubli", 8, 80, function() return state.pairRadius end, function(v) state.pairRadius = v end)
+makeSlider(pageSet, "Czulosc ruchu %", 40, 220, function() return state.moveScale end, function(v) state.moveScale = v end)
+makeSlider(pageSet, "Zasieg etykiet", 60, 900, function() return state.labelDist end, function(v) state.labelDist = v clearAllMarks() end)
+makeSlider(pageSet, "Przezroczystosc %", 10, 85, function() return state.fillTrans end, function(v) state.fillTrans = v clearAllMarks() end)
+makeToggle(pageSet, "Tylko obiekty z listy", "onlyPriority", function() return state.onlyPriority end, function(v) state.onlyPriority = v clearAllMarks() end)
 makeBox(pageSet, "Ignoruj nazwy (po przecinku)", "plate, cup, door")
 makeHint(pageSet, "Typy na tablecie. Wylaczone nie wchodza na liste ani na podswietlenie.", 28)
 
 local function typeToggle(label, key)
-	makeToggle(pageSet, label, key, function()
-		return state[key]
-	end, function(v)
-		state[key] = v
-		clearAllMarks()
-	end)
+	makeToggle(pageSet, label, key, function() return state[key] end, function(v) state[key] = v clearAllMarks() end)
 end
 typeToggle("Moved Object", "repMoved")
 typeToggle("Extra Object", "repExtra")
@@ -1931,11 +1857,8 @@ typeToggle("Distorted Object", "repDistorted")
 typeToggle("Other", "repOther")
 typeToggle("Intruder", "repIntruder")
 
--- ========== INPUT ==========
 track(UserInputService.InputChanged:Connect(function(inp)
-	if not dragging then
-		return
-	end
+	if not dragging then return end
 	if inp.UserInputType ~= Enum.UserInputType.MouseMovement and inp.UserInputType ~= Enum.UserInputType.Touch then
 		return
 	end
@@ -1946,6 +1869,9 @@ end))
 track(UserInputService.InputBegan:Connect(function(io, gp)
 	local k = io.KeyCode
 	local typing = UserInputService:GetFocusedTextBox() ~= nil
+	if k == Enum.KeyCode.R and not typing and hookTablet then
+		hookTablet()
+	end
 	if not gp and not typing then
 		if k == Enum.KeyCode.RightShift then
 			main.Visible = not main.Visible
@@ -1968,40 +1894,39 @@ track(UserInputService.InputBegan:Connect(function(io, gp)
 			statusOverride = string.format("Snapshot: %d obiektow", n)
 			statusOverrideUntil = os.clock() + 3
 			refreshAnomalyList()
+		elseif k == Enum.KeyCode.T then
+			if reportAnomaly then
+				local pick = anomalyItems[1]
+				for _, it in ipairs(anomalyItems) do
+					if it.reason == "Intruder" then
+						pick = it
+						break
+					end
+				end
+				if pick then
+					reportAnomaly(pick)
+				end
+			end
 		end
 	end
-	if typing then
-		return
-	end
-	if k == Enum.KeyCode.W then
-		input.fwd = true
-	elseif k == Enum.KeyCode.S then
-		input.back = true
-	elseif k == Enum.KeyCode.A then
-		input.left = true
-	elseif k == Enum.KeyCode.D then
-		input.right = true
-	elseif k == Enum.KeyCode.Space then
-		input.up = true
-	elseif k == Enum.KeyCode.LeftControl then
-		input.down = true
+	if typing then return end
+	if k == Enum.KeyCode.W then input.fwd = true
+	elseif k == Enum.KeyCode.S then input.back = true
+	elseif k == Enum.KeyCode.A then input.left = true
+	elseif k == Enum.KeyCode.D then input.right = true
+	elseif k == Enum.KeyCode.Space then input.up = true
+	elseif k == Enum.KeyCode.LeftControl then input.down = true
 	end
 end))
 
 track(UserInputService.InputEnded:Connect(function(io)
 	local k = io.KeyCode
-	if k == Enum.KeyCode.W then
-		input.fwd = false
-	elseif k == Enum.KeyCode.S then
-		input.back = false
-	elseif k == Enum.KeyCode.A then
-		input.left = false
-	elseif k == Enum.KeyCode.D then
-		input.right = false
-	elseif k == Enum.KeyCode.Space then
-		input.up = false
-	elseif k == Enum.KeyCode.LeftControl then
-		input.down = false
+	if k == Enum.KeyCode.W then input.fwd = false
+	elseif k == Enum.KeyCode.S then input.back = false
+	elseif k == Enum.KeyCode.A then input.left = false
+	elseif k == Enum.KeyCode.D then input.right = false
+	elseif k == Enum.KeyCode.Space then input.up = false
+	elseif k == Enum.KeyCode.LeftControl then input.down = false
 	end
 end))
 
@@ -2018,9 +1943,7 @@ track(RunService.Stepped:Connect(function()
 end))
 
 track(RunService.Heartbeat:Connect(function()
-	if not running then
-		return
-	end
+	if not running then return end
 	Camera = Workspace.CurrentCamera
 	refreshChar()
 	if state.fly and hrp and bv and bg then
@@ -2030,12 +1953,8 @@ track(RunService.Heartbeat:Connect(function()
 		end
 		local m = getMove() * 80
 		local vy = 0
-		if input.up then
-			vy = 60
-		end
-		if input.down then
-			vy = -60
-		end
+		if input.up then vy = 60 end
+		if input.down then vy = -60 end
 		bv.Velocity = Vector3.new(m.X, vy, m.Z)
 	end
 	if humanoid then
@@ -2070,16 +1989,22 @@ track(RunService.Heartbeat:Connect(function()
 	end
 end))
 
-track(Workspace.DescendantAdded:Connect(function(obj)
-	if not running or not state.anomaly or not snapped then
+local extraQueue = {}
+local extraQueued = false
+local function flushExtras()
+	extraQueued = false
+	if not running or not snapped then
+		table.clear(extraQueue)
 		return
 	end
-	task.defer(function()
-		if not running or not obj.Parent then
-			return
-		end
-		if isOurStuff(obj) or isPlayerRelated(obj) then
-			return
+	local batch = extraQueue
+	extraQueue = {}
+	local n = 0
+	for _, obj in ipairs(batch) do
+		n += 1
+		if n % 250 == 0 then task.wait() end
+		if not obj.Parent or isOurStuff(obj) or isPlayerRelated(obj) then
+			continue
 		end
 		if obj:IsA("Humanoid") then
 			local model = obj.Parent
@@ -2088,60 +2013,67 @@ track(Workspace.DescendantAdded:Connect(function(obj)
 					intruderWatch[model] = true
 				end
 			end
-			return
+			continue
 		end
 		if obj:IsA("BasePart") and isTrackable(obj) and not tracked[obj] then
 			local hum = humanoidModelOf(obj)
 			if hum and not playerModelOf(hum) and not knownHumanoids[hum] then
 				intruderWatch[hum] = true
-				return
+				continue
 			end
 			extras[obj] = obj.Parent
 		elseif obj:IsA("Model") then
 			local hum = obj:FindFirstChildOfClass("Humanoid")
 			if hum and not playerModelOf(obj) and not knownHumanoids[obj] then
 				intruderWatch[obj] = true
-				return
+				continue
 			end
+			local added = 0
 			for _, d in ipairs(obj:GetDescendants()) do
+				if added > 40 then break end
 				if d:IsA("BasePart") and isTrackable(d) and not tracked[d] then
 					extras[d] = obj
+					added += 1
 				end
 			end
 		elseif obj:IsA("Light") and not tracked[obj] then
 			extras[obj] = obj.Parent
-		elseif obj:IsA("Decal") or obj:IsA("Texture") or obj:IsA("ParticleEmitter") or obj:IsA("SurfaceGui") then
+		elseif obj:IsA("Decal") or obj:IsA("Texture") or obj:IsA("ParticleEmitter") or obj:IsA("SurfaceGui") or obj:IsA("SurfaceAppearance") then
 			local host = obj.Parent
-			if host and host:IsA("BasePart") and not isPlayerRelated(host) and not tracked[host] then
-				extras[host] = host.Parent
+			if host and host:IsA("BasePart") and not isPlayerRelated(host) then
+				local data = tracked[host]
+				if data then
+					data.forceImg = true
+					if obj:IsA("ParticleEmitter") then data.hasFx = true end
+				else
+					extras[host] = host.Parent
+				end
 			end
 		end
-	end)
+	end
+end
+
+track(Workspace.DescendantAdded:Connect(function(obj)
+	if not running or not state.anomaly or not snapped then return end
+	extraQueue[#extraQueue + 1] = obj
+	if extraQueued then return end
+	extraQueued = true
+	task.defer(flushExtras)
 end))
 
 track(player.CharacterAdded:Connect(function(c)
 	char = c
 	task.wait(0.35)
-	if not running then
-		return
-	end
+	if not running then return end
 	refreshChar()
 	applySpeedJump()
-	if state.fly then
-		setFlyState(true)
-	end
-	if state.noclip then
-		setNoclip(true)
-	end
+	if state.fly then setFlyState(true) end
+	if state.noclip then setNoclip(true) end
 	if state.chams then
-		for _, p in ipairs(Players:GetPlayers()) do
-			createChams(p)
-		end
+		for _, p in ipairs(Players:GetPlayers()) do createChams(p) end
 	end
 	if state.names then
-		for _, p in ipairs(Players:GetPlayers()) do
-			createName(p)
-		end
+		for _, p in ipairs(Players:GetPlayers()) do createName(p) end
 	end
 end))
 
@@ -2149,14 +2081,227 @@ track(player.CharacterRemoving:Connect(function()
 	destroyFly()
 end))
 
+local function guiText(g)
+	if g:IsA("TextButton") or g:IsA("TextLabel") or g:IsA("TextBox") then
+		return string.lower(g.Text or "")
+	end
+	return ""
+end
+
+local TYPE_NAMES = {
+	"distorted object", "strange imagery", "strange light", "missing object",
+	"extra object", "moved object", "intruder", "other",
+}
+
+local function prettyWords(low)
+	local parts = {}
+	for w in string.gmatch(low, "%a+") do
+		parts[#parts + 1] = string.upper(string.sub(w, 1, 1)) .. string.sub(w, 2)
+	end
+	return table.concat(parts, " ")
+end
+
+local function reasonFromBlob(blob)
+	blob = string.lower(blob or "")
+	local best, bestLen
+	for _, name in ipairs(TYPE_NAMES) do
+		if string.find(blob, name, 1, true) and (not bestLen or #name > bestLen) then
+			best = name
+			bestLen = #name
+		end
+	end
+	if not best then return nil end
+	return prettyWords(best)
+end
+
+local pinnedItem
+
+local function pickItem(reason)
+	if pinnedItem and pinnedItem.pos and (not reason or pinnedItem.reason == reason) then
+		return pinnedItem
+	end
+	local best
+	for _, it in ipairs(anomalyItems) do
+		if it.pos and (not reason or it.reason == reason) then
+			if not best or (it.dist or 1e9) < (best.dist or 1e9) then
+				best = it
+			end
+		end
+	end
+	return best
+end
+
+local savedBodyCf
+local savedCamType, savedCamCf, savedCamSub
+local snapUntil = 0
+local snapItem
+
+local function holdCamera()
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	if not savedCamCf then
+		savedCamType = cam.CameraType
+		savedCamCf = cam.CFrame
+		savedCamSub = cam.CameraSubject
+	end
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.CFrame = savedCamCf
+end
+
+local function restoreBody()
+	refreshChar()
+	if hrp and savedBodyCf then
+		hrp.CFrame = savedBodyCf
+		pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+	end
+	savedBodyCf = nil
+	snapItem = nil
+	snapUntil = 0
+	local cam = Workspace.CurrentCamera
+	if cam and savedCamCf then
+		pcall(function()
+			cam.CameraSubject = savedCamSub
+			cam.CameraType = savedCamType or Enum.CameraType.Custom
+			cam.CFrame = savedCamCf
+		end)
+	end
+	savedCamCf = nil
+end
+
+local function snapBodyTo(item, hold)
+	refreshChar()
+	if not hrp or not item or not item.pos then return false end
+	if state.reportGlance == false then return false end
+	if not savedBodyCf then
+		savedBodyCf = hrp.CFrame
+	end
+	holdCamera()
+	hrp.CFrame = CFrame.new(item.pos + Vector3.new(0, 3.2, 0))
+	pcall(function()
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end)
+	snapItem = item
+	snapUntil = os.clock() + (hold or 0.7)
+	return true
+end
+
+local hookedBtns = {}
+
+local function hookClick(btn, reason)
+	if hookedBtns[btn] then return end
+	hookedBtns[btn] = true
+	local function before()
+		local item = pickItem(reason)
+		if item then
+			snapBodyTo(item, 0.85)
+			statusOverride = "Raport z zewnatrz: " .. item.reason
+			statusOverrideUntil = os.clock() + 2
+		end
+	end
+	local wrapped = false
+	pcall(function()
+		if getconnections and hookfunction then
+			for _, sigName in ipairs({ "MouseButton1Click", "MouseButton1Down", "Activated" }) do
+				local sig = btn[sigName]
+				if typeof(sig) == "RBXScriptSignal" then
+					for _, c in ipairs(getconnections(sig)) do
+						if c.Function then
+							local original
+							original = hookfunction(c.Function, function(...)
+								before()
+								task.wait(0.1)
+								return original(...)
+							end)
+							wrapped = true
+						end
+					end
+				end
+			end
+		end
+	end)
+	btn.MouseButton1Down:Connect(function()
+		if not wrapped then before() end
+	end)
+end
+
+hookTablet = function()
+	task.delay(0.12, function()
+		for _, g in ipairs(playerGui:GetDescendants()) do
+			if g:FindFirstAncestor("AnomalySuite") then continue end
+			if g:IsA("TextButton") or g:IsA("ImageButton") then
+				local blob = guiText(g) .. " " .. string.lower(g.Name)
+				if g.Parent then
+					blob ..= " " .. guiText(g.Parent) .. " " .. string.lower(g.Parent.Name)
+				end
+				local reason = reasonFromBlob(blob)
+				if reason then hookClick(g, reason) end
+			end
+		end
+	end)
+end
+
+local function buttonUnderMouse()
+	local pos = UserInputService:GetMouseLocation()
+	local list = playerGui:GetGuiObjectsAtPosition(pos.X, pos.Y)
+	for _, g in ipairs(list) do
+		if not g:FindFirstAncestor("AnomalySuite") then
+			local blob = guiText(g) .. " " .. string.lower(g.Name)
+			if g.Parent then
+				blob ..= " " .. guiText(g.Parent) .. " " .. string.lower(g.Parent.Name)
+			end
+			local reason = reasonFromBlob(blob)
+			if reason then return reason end
+		end
+	end
+	return nil
+end
+
+reportAnomaly = function(item)
+	if not item then return end
+	pinnedItem = item
+	snapBodyTo(item, 1.1)
+	hookTablet()
+	statusOverride = "Wybrane: " .. item.reason .. "  — kliknij ten typ na tablecie (R)"
+	statusOverrideUntil = os.clock() + 3
+	refreshAnomalyList()
+end
+
+task.spawn(function()
+	while running do
+		if snapItem and os.clock() < snapUntil and hrp then
+			hrp.CFrame = CFrame.new(snapItem.pos + Vector3.new(0, 3.2, 0))
+			holdCamera()
+		elseif savedBodyCf and os.clock() >= snapUntil then
+			restoreBody()
+		end
+		task.wait(0.03)
+	end
+end)
+
+track(UserInputService.InputChanged:Connect(function(inp)
+	if inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+	local reason = buttonUnderMouse()
+	if not reason then return end
+	local item = pickItem(reason)
+	if item then snapBodyTo(item, 0.55) end
+end))
+
+track(UserInputService.InputBegan:Connect(function(inp)
+	if inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	local reason = buttonUnderMouse()
+	if not reason then return end
+	local item = pickItem(reason)
+	if item then snapBodyTo(item, 0.9) end
+end))
+
 task.spawn(function()
 	local monsterAcc = 0
 	local noneRefresh = 0
+	local reportAcc = 0
 	while running do
 		local threat = readThreat()
-		if threat then
-			handleThreat(threat)
-		end
+		if threat then handleThreat(threat) end
 		if state.autoSnap and snapped and not baselineLocked and isCleanThreat(string.lower(currentThreat or "")) then
 			noneRefresh += 0.55
 			if noneRefresh >= 8 and os.clock() - snapClock >= 8 then
@@ -2166,17 +2311,29 @@ task.spawn(function()
 		else
 			noneRefresh = 0
 		end
-		if state.anomaly then
-			scanAnomalies()
-		end
-		monsterAcc += 0.55
-		if monsterAcc >= 2 then
-			monsterAcc = 0
-			if state.monster then
-				scanMonsters()
+		if state.anomaly then scanAnomalies() end
+		if state.autoReport and not reportBusy and #anomalyItems > 0 then
+			reportAcc += 0.28
+			if reportAcc >= 2.4 then
+				reportAcc = 0
+				local pick = anomalyItems[1]
+				for _, it in ipairs(anomalyItems) do
+					if it.reason == "Intruder" then
+						pick = it
+						break
+					end
+				end
+				if pick and reportAnomaly then reportAnomaly(pick) end
 			end
+		else
+			reportAcc = 0
 		end
-		task.wait(0.55)
+		monsterAcc += 0.28
+		if monsterAcc >= 5 then
+			monsterAcc = 0
+			if state.monster then scanMonsters() end
+		end
+		task.wait(0.28)
 	end
 end)
 
@@ -2192,21 +2349,15 @@ local function cleanup()
 	clearNames()
 	clearMonsters()
 	setFullbright(false)
-	if Camera then
-		Camera.FieldOfView = originalFOV
-	end
+	if Camera then Camera.FieldOfView = originalFOV end
 	for _, c in ipairs(conns) do
-		pcall(function()
-			c:Disconnect()
-		end)
+		pcall(function() c:Disconnect() end)
 	end
-	if screen then
-		screen:Destroy()
-	end
+	if screen then screen:Destroy() end
 end
 
 if ENV then
 	ENV.AnomalySuiteCleanup = cleanup
 end
 
-print("[Anomaly Suite] Menu: RightShift | ESP: J | Snapshot: K | Filtr: dubli / typy")
+print("[Anomaly Suite] RightShift menu | J ESP | K snapshot | R typ na tablecie z zewnatrz")
